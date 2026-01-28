@@ -1,0 +1,454 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Upload, FileText, Download, RefreshCw, AlertCircle, CheckCircle2, Settings, Image as ImageIcon, X } from 'lucide-react';
+
+/**
+ * 外部スクリプトを動的に読み込むフック
+ */
+const useExternalScripts = (urls) => {
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    let scriptElements = [];
+    
+    const loadScript = (url) => {
+      return new Promise((resolve, reject) => {
+        if (document.querySelector(`script[src="${url}"]`)) {
+          resolve();
+          return;
+        }
+        const script = document.createElement('script');
+        script.src = url;
+        script.async = true;
+        script.onload = resolve;
+        script.onerror = reject;
+        document.body.appendChild(script);
+        scriptElements.push(script);
+      });
+    };
+
+    Promise.all(urls.map(loadScript))
+      .then(() => setLoaded(true))
+      .catch((err) => {
+        console.error("Script load error:", err);
+        setError(true);
+      });
+
+    // クリーンアップは行わない
+  }, [JSON.stringify(urls)]);
+
+  return { loaded, error };
+};
+
+const PDFCompressor = () => {
+  // バージョンを定数化して整合性を保つ
+  const PDFJS_VERSION = "3.11.174";
+  
+  // 必要なライブラリを読み込み
+  const { loaded, error: scriptError } = useExternalScripts([
+    `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/build/pdf.min.js`,
+    "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"
+  ]);
+
+  const [file, setFile] = useState(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [quality, setQuality] = useState(0.6); // デフォルト画質 60%
+  const [scale, setScale] = useState(1.0); // 解像度倍率
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [statusMessage, setStatusMessage] = useState("");
+  const [compressedPdf, setCompressedPdf] = useState(null);
+  const [originalSize, setOriginalSize] = useState(0);
+  const [compressedSize, setCompressedSize] = useState(0);
+  const [error, setError] = useState("");
+  const [currentPage, setCurrentPage] = useState(0);
+  const [totalPages, setTotalPages] = useState(0);
+
+  // PDF.jsのワーカー設定
+  useEffect(() => {
+    if (loaded && window.pdfjsLib) {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.js`;
+    }
+  }, [loaded]);
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = () => {
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const droppedFile = e.dataTransfer.files[0];
+    if (droppedFile && droppedFile.type === "application/pdf") {
+      processFile(droppedFile);
+    } else {
+      setError("PDFファイルのみアップロード可能です．");
+    }
+  };
+
+  const handleFileSelect = (e) => {
+    const selectedFile = e.target.files[0];
+    if (selectedFile && selectedFile.type === "application/pdf") {
+      processFile(selectedFile);
+    }
+  };
+
+  const processFile = (inputFile) => {
+    setFile(inputFile);
+    setOriginalSize(inputFile.size);
+    setCompressedPdf(null);
+    setCompressedSize(0);
+    setError("");
+    setProgress(0);
+    setCurrentPage(0);
+    setTotalPages(0);
+  };
+
+  const formatSize = (bytes) => {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
+  const compressPDF = async () => {
+    if (!file || !loaded) return;
+
+    setIsProcessing(true);
+    setStatusMessage("PDFを読み込んでいます...");
+    setError("");
+    setProgress(0);
+
+    try {
+      const fileReader = new FileReader();
+      
+      fileReader.onload = async function() {
+        try {
+          const typedarray = new Uint8Array(this.result);
+          
+          // 修正点: Unpkgを使用して確実なパスを指定し、標準フォントデータも読み込む
+          const loadingTask = window.pdfjsLib.getDocument({
+            data: typedarray,
+            // 日本語文字コードマップのパス (unpkgを使用)
+            cMapUrl: `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/cmaps/`,
+            cMapPacked: true,
+            // 標準フォントデータのパス (これが不足すると英数字や基本記号が消えることがある)
+            standardFontDataUrl: `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/standard_fonts/`,
+          });
+
+          const pdf = await loadingTask.promise;
+          const numPages = pdf.numPages;
+          setTotalPages(numPages);
+
+          const { jsPDF } = window.jspdf;
+          const doc = new jsPDF();
+          doc.deletePage(1);
+
+          for (let i = 1; i <= numPages; i++) {
+            setStatusMessage(`ページ ${i} / ${numPages} を処理中...`);
+            setCurrentPage(i);
+            
+            const page = await pdf.getPage(i);
+            const viewport = page.getViewport({ scale: scale * 1.5 });
+
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d', { alpha: false }); // アルファチャネル無効化で描画安定化
+            canvas.height = viewport.height;
+            canvas.width = viewport.width;
+
+            // 背景を白で塗りつぶす
+            context.fillStyle = '#FFFFFF';
+            context.fillRect(0, 0, canvas.width, canvas.height);
+
+            await page.render({
+              canvasContext: context,
+              viewport: viewport,
+            }).promise;
+
+            const imgData = canvas.toDataURL('image/jpeg', quality);
+            
+            const originalViewport = page.getViewport({ scale: 1.0 });
+            const orientation = originalViewport.width > originalViewport.height ? 'l' : 'p';
+            doc.addPage([originalViewport.width, originalViewport.height], orientation);
+            
+            doc.addImage(imgData, 'JPEG', 0, 0, originalViewport.width, originalViewport.height, null, 'FAST');
+            
+            setProgress(Math.round((i / numPages) * 100));
+            
+            canvas.width = 0;
+            canvas.height = 0;
+          }
+
+          setStatusMessage("最終ファイルを生成中...");
+          const pdfOutput = doc.output('blob');
+          setCompressedPdf(pdfOutput);
+          setCompressedSize(pdfOutput.size);
+          setIsProcessing(false);
+          setStatusMessage("完了しました！");
+
+        } catch (err) {
+          console.error(err);
+          setError("PDFの処理中にエラーが発生しました: " + err.message);
+          setIsProcessing(false);
+        }
+      };
+
+      fileReader.readAsArrayBuffer(file);
+
+    } catch (err) {
+      setError("ファイルの読み込みに失敗しました．");
+      setIsProcessing(false);
+    }
+  };
+
+  const downloadPDF = () => {
+    if (!compressedPdf) return;
+    const url = URL.createObjectURL(compressedPdf);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `compressed_${file.name}`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const reset = () => {
+    setFile(null);
+    setCompressedPdf(null);
+    setOriginalSize(0);
+    setCompressedSize(0);
+    setProgress(0);
+    setError("");
+    setStatusMessage("");
+  };
+
+  if (scriptError) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-50 text-red-600">
+        <AlertCircle className="mr-2" />
+        ライブラリの読み込みに失敗しました．ページを再読み込みしてください．
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 py-12 px-4 sm:px-6 lg:px-8 font-sans text-slate-800">
+      <div className="max-w-3xl mx-auto">
+        <div className="text-center mb-10">
+          <div className="flex justify-center mb-4">
+            <div className="p-3 bg-blue-600 rounded-2xl shadow-lg shadow-blue-200">
+              <FileText className="h-8 w-8 text-white" />
+            </div>
+          </div>
+          <h1 className="text-3xl font-bold text-slate-900 mb-2">
+            PDF 圧縮ツール
+          </h1>
+          <p className="text-slate-600">
+            ブラウザだけで完結．サーバーにファイルは送信されません．
+          </p>
+        </div>
+
+        <div className="bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-100">
+          {/* Main Content Area */}
+          <div className="p-8">
+            {!file ? (
+              <div
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+                className={`relative border-2 border-dashed rounded-2xl p-12 text-center transition-all duration-300 ${
+                  isDragging
+                    ? 'border-blue-500 bg-blue-50 scale-[1.02]'
+                    : 'border-slate-300 hover:border-blue-400 hover:bg-slate-50'
+                }`}
+              >
+                <input
+                  type="file"
+                  accept="application/pdf"
+                  onChange={handleFileSelect}
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                />
+                <div className="flex flex-col items-center">
+                  <Upload className={`h-12 w-12 mb-4 ${isDragging ? 'text-blue-500' : 'text-slate-400'}`} />
+                  <p className="text-lg font-medium text-slate-700 mb-2">
+                    PDFファイルをここにドロップ
+                  </p>
+                  <p className="text-sm text-slate-500">
+                    またはクリックしてファイルを選択
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-8">
+                {/* File Info Header */}
+                <div className="flex items-center justify-between bg-slate-50 p-4 rounded-xl border border-slate-200">
+                  <div className="flex items-center space-x-3 overflow-hidden">
+                    <div className="p-2 bg-red-100 rounded-lg">
+                      <FileText className="h-6 w-6 text-red-500" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="font-medium text-slate-900 truncate max-w-[200px] sm:max-w-md">
+                        {file.name}
+                      </p>
+                      <p className="text-sm text-slate-500">
+                        現在のサイズ: {formatSize(originalSize)}
+                      </p>
+                    </div>
+                  </div>
+                  {!isProcessing && !compressedPdf && (
+                    <button
+                      onClick={reset}
+                      className="p-2 hover:bg-slate-200 rounded-full transition-colors text-slate-500"
+                      title="ファイルを削除"
+                    >
+                      <X className="h-5 w-5" />
+                    </button>
+                  )}
+                </div>
+
+                {/* Settings & Actions */}
+                {!compressedPdf && !isProcessing && (
+                  <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                    <div className="bg-blue-50/50 p-6 rounded-2xl border border-blue-100">
+                      <div className="flex items-center mb-4">
+                        <Settings className="h-5 w-5 text-blue-600 mr-2" />
+                        <h3 className="font-semibold text-slate-800">圧縮設定</h3>
+                      </div>
+                      
+                      <div className="space-y-4">
+                        <div>
+                          <div className="flex justify-between mb-2">
+                            <label className="text-sm font-medium text-slate-700">画質レベル (低 - 高)</label>
+                            <span className="text-sm font-bold text-blue-600">{Math.round(quality * 100)}%</span>
+                          </div>
+                          <input
+                            type="range"
+                            min="0.1"
+                            max="1.0"
+                            step="0.1"
+                            value={quality}
+                            onChange={(e) => setQuality(parseFloat(e.target.value))}
+                            className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                          />
+                          <p className="text-xs text-slate-500 mt-2 flex items-start">
+                            <AlertCircle className="h-3 w-3 mr-1 mt-0.5 flex-shrink-0" />
+                            数値を下げるとファイルサイズは小さくなりますが，文字が読みづらくなる可能性があります．0.5〜0.7程度がおすすめです．
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex justify-center">
+                      <button
+                        onClick={compressPDF}
+                        disabled={!loaded}
+                        className="group relative inline-flex items-center justify-center px-8 py-3 text-base font-semibold text-white transition-all duration-200 bg-blue-600 rounded-full hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-600 shadow-md hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {loaded ? '圧縮を開始' : 'ライブラリ読込中...'}
+                        <ImageIcon className="ml-2 h-5 w-5" />
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Processing State */}
+                {isProcessing && (
+                  <div className="text-center py-8 animate-in fade-in duration-300">
+                    <div className="relative w-24 h-24 mx-auto mb-6">
+                      <svg className="animate-spin w-full h-full text-blue-100" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <span className="text-sm font-bold text-blue-600">{progress}%</span>
+                      </div>
+                    </div>
+                    <h3 className="text-lg font-medium text-slate-900 mb-1">最適化処理中...</h3>
+                    <p className="text-slate-500 text-sm">{statusMessage}</p>
+                    {totalPages > 0 && (
+                      <div className="w-full max-w-xs mx-auto mt-4 bg-slate-100 rounded-full h-2">
+                        <div 
+                          className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+                          style={{ width: `${(currentPage / totalPages) * 100}%` }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Result State */}
+                {compressedPdf && (
+                  <div className="animate-in zoom-in-95 duration-500">
+                    <div className="bg-green-50 border border-green-200 rounded-2xl p-6 mb-6 text-center">
+                      <div className="inline-flex items-center justify-center p-3 bg-green-100 rounded-full mb-4">
+                        <CheckCircle2 className="h-8 w-8 text-green-600" />
+                      </div>
+                      <h3 className="text-xl font-bold text-green-900 mb-2">圧縮完了！</h3>
+                      
+                      <div className="flex items-center justify-center space-x-8 mt-6 mb-2">
+                        <div className="text-center">
+                          <p className="text-xs text-slate-500 uppercase tracking-wide mb-1">元のサイズ</p>
+                          <p className="text-lg font-semibold text-slate-700">{formatSize(originalSize)}</p>
+                        </div>
+                        <div className="h-8 w-px bg-slate-300"></div>
+                        <div className="text-center">
+                          <p className="text-xs text-slate-500 uppercase tracking-wide mb-1">圧縮後</p>
+                          <p className="text-2xl font-bold text-green-600">{formatSize(compressedSize)}</p>
+                        </div>
+                      </div>
+                      
+                      <div className="mt-2 inline-block px-3 py-1 bg-green-200 text-green-800 text-xs font-bold rounded-full">
+                        {Math.round((1 - compressedSize / originalSize) * 100)}% 削減
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col sm:flex-row gap-4 justify-center">
+                      <button
+                        onClick={downloadPDF}
+                        className="flex-1 sm:flex-none inline-flex items-center justify-center px-6 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition-colors shadow-lg shadow-blue-200 font-semibold"
+                      >
+                        <Download className="h-5 w-5 mr-2" />
+                        ダウンロード
+                      </button>
+                      <button
+                        onClick={reset}
+                        className="flex-1 sm:flex-none inline-flex items-center justify-center px-6 py-3 bg-white text-slate-700 border border-slate-200 rounded-xl hover:bg-slate-50 transition-colors font-medium"
+                      >
+                        <RefreshCw className="h-5 w-5 mr-2" />
+                        別のファイルを処理
+                      </button>
+                    </div>
+                    
+                    <p className="text-xs text-center text-slate-400 mt-6">
+                      ※ 注意: 圧縮されたPDFは画像ベースとなります．テキストの選択や検索はできません．
+                    </p>
+                  </div>
+                )}
+
+                {error && (
+                  <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-xl flex items-start animate-in slide-in-from-top-2">
+                    <AlertCircle className="h-5 w-5 mr-2 mt-0.5 flex-shrink-0" />
+                    <p>{error}</p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+        
+        <div className="text-center mt-8 text-slate-400 text-sm">
+          <p>© 2026 Secure PDF Tools. All processing happens locally.</p>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default PDFCompressor;
